@@ -1,16 +1,19 @@
 package com.loghog;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.atomic.DoubleAdder;
 
 public class LogMetricsParser {
     private final AtomicLong errorCount = new AtomicLong(0);
     private final Set<String> uniqueErrorIps = ConcurrentHashMap.newKeySet();
-    private final List<Integer> checkoutLatencies = Collections.synchronizedList(new ArrayList<>());
+
+    // Thread-safe running totals keeping memory footprint completely flat (O(1))
+    private final LongAdder latencyCount = new LongAdder();
+    private final LongAdder latencySum = new LongAdder();
+    private final DoubleAdder latencySumSquares = new DoubleAdder();
 
     @Extractor(".*ERROR.*")
     public void countErrors(LogEntry entry) {
@@ -20,7 +23,11 @@ public class LogMetricsParser {
 
     @Extractor(".*POST /checkout.*")
     public void measureLatency(LogEntry entry) {
-        entry.latencyMs().ifPresent(checkoutLatencies::add);
+        entry.latencyMs().ifPresent(ms -> {
+            latencyCount.increment();
+            latencySum.add(ms);
+            latencySumSquares.add((double) ms * ms);
+        });
     }
 
     public long getErrorCount() {
@@ -31,7 +38,14 @@ public class LogMetricsParser {
         return uniqueErrorIps;
     }
 
-    public List<Integer> getCheckoutLatencies() {
-        return checkoutLatencies;
+    public double[] getLatencyStats() {
+        long n = latencyCount.sum();
+        if (n == 0) {
+            return new double[]{0.0, 0.0};
+        }
+        double mean = (double) latencySum.sum() / n;
+        double variance = latencySumSquares.sum() / n - mean * mean;
+        double stdDev = Math.sqrt(Math.max(variance, 0.0));
+        return new double[]{mean, stdDev};
     }
 }

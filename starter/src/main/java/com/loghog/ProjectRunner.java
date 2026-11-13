@@ -51,11 +51,10 @@ public class ProjectRunner {
         Path badDataFile = Paths.get("bad_data.log");
         Files.writeString(badDataFile, "", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-        // Bounded concurrency using a Semaphore to prevent unbounded future accumulation
+        // Bounded concurrency using a Semaphore; eliminated the growing futures list entirely.
         int maxInFlightBatches = 64;
         Semaphore semaphore = new Semaphore(maxInFlightBatches);
         int batchSize = 1000;
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
              BufferedWriter badDataWriter = Files.newBufferedWriter(badDataFile, StandardOpenOption.APPEND);
@@ -70,41 +69,38 @@ public class ProjectRunner {
                     List<String> batchToProcess = new ArrayList<>(currentBatch);
                     currentBatch.clear();
 
-                    semaphore.acquire(); // Throttle producer if consumer threads are saturated
-                    CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    semaphore.acquire(); // Throttle producer when tasks are saturated
+                    CompletableFuture.runAsync(() -> {
                         try {
                             processBatch(batchToProcess, metricsParser, extractorCache, badDataWriter);
                         } finally {
                             semaphore.release();
                         }
                     }, executor);
-                    futures.add(future);
                 }
             }
 
             if (!currentBatch.isEmpty()) {
                 List<String> batchToProcess = new ArrayList<>(currentBatch);
                 semaphore.acquire();
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                CompletableFuture.runAsync(() -> {
                     try {
                         processBatch(batchToProcess, metricsParser, extractorCache, badDataWriter);
                     } finally {
                         semaphore.release();
                     }
                 }, executor);
-                futures.add(future);
             }
 
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            // Block main thread until all in-flight batches finish by reclaiming all permits
+            semaphore.acquire(maxInFlightBatches);
 
         } catch (Exception e) {
             e.printStackTrace();
         }
 
-        // SIMD Statistics with the Vector API
-        List<Integer> latenciesList = metricsParser.getCheckoutLatencies();
-        int[] latenciesArray = latenciesList.stream().mapToInt(i -> i).toArray();
-        double[] stats = VectorStatistics.calculateMeanAndStdDev(latenciesArray);
+        // Retrieve final stats calculated via memory-flat running adders
+        double[] stats = metricsParser.getLatencyStats();
 
         long endTime = System.nanoTime();
         long durationMs = (endTime - startTime) / 1_000_000;
@@ -113,7 +109,7 @@ public class ProjectRunner {
         System.out.println("\n--- LogHog Analysis Complete ---");
         System.out.println("Total ERROR logs found: " + metricsParser.getErrorCount());
         System.out.println("Unique IP addresses causing errors: " + metricsParser.getUniqueErrorIps());
-        System.out.printf("Average latency for /checkout (Vector API): %.2f ms (StdDev: %.2f ms)\n", stats[0], stats[1]);
+        System.out.printf("Average latency for /checkout: %.2f ms (StdDev: %.2f ms)\n", stats[0], stats[1]);
         System.out.println("\nTotal execution time: " + durationMs + " ms");
 
         waitForProfiler();
